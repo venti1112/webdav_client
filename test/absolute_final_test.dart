@@ -195,7 +195,7 @@ void main() {
     test('element with namespace but no prefix shows as {uri}name', () {
       const xml = '''
 <?xml version="1.0" encoding="utf-8"?>
-<d:multistatus xmlns:custom="http://example.com/ns">
+<d:multistatus xmlns:d="DAV:" xmlns:custom="http://example.com/ns">
   <d:response>
     <d:href>/test</d:href>
     <d:propstat>
@@ -230,107 +230,6 @@ void main() {
         () => client.setProps('/file', {'d:displayname': 'x'}),
         throwsA(isA<WebdavException>()),
       );
-    });
-  });
-
-  // ========== webdav_file.dart:286,291,308 ==========
-  group('WebdavFile._normalizeHrefForComparison remaining paths', () {
-    test('href with ?query stripped for self-comparison (line 286)', () {
-      const xml = '''
-<?xml version="1.0" encoding="utf-8"?>
-<d:multistatus xmlns:d="DAV:">
-  <d:response>
-    <d:href>/dir/?v=1</d:href>
-    <d:propstat>
-      <d:prop>
-        <d:resourcetype><d:collection/></d:resourcetype>
-        <d:displayname>dir</d:displayname>
-      </d:prop>
-      <d:status>HTTP/1.1 200 OK</d:status>
-    </d:propstat>
-  </d:response>
-  <d:response>
-    <d:href>/dir/file.txt</d:href>
-    <d:propstat>
-      <d:prop>
-        <d:resourcetype/>
-        <d:displayname>file.txt</d:displayname>
-      </d:prop>
-      <d:status>HTTP/1.1 200 OK</d:status>
-    </d:propstat>
-  </d:response>
-</d:multistatus>
-''';
-      // base '/dir/' → normalized '/dir/' (collection)
-      // self href '/dir/?v=1' → strip query → '/dir/' → matches base → skip
-      final files = WebdavFile.parseFiles('/dir/', xml, skipSelf: true);
-      expect(files.length, 1);
-      expect(files.first.name, 'file.txt');
-    });
-
-    test('href with #fragment stripped for self-comparison (line 291)', () {
-      const xml = '''
-<?xml version="1.0" encoding="utf-8"?>
-<d:multistatus xmlns:d="DAV:">
-  <d:response>
-    <d:href>/dir/#top</d:href>
-    <d:propstat>
-      <d:prop>
-        <d:resourcetype><d:collection/></d:resourcetype>
-        <d:displayname>dir</d:displayname>
-      </d:prop>
-      <d:status>HTTP/1.1 200 OK</d:status>
-    </d:propstat>
-  </d:response>
-  <d:response>
-    <d:href>/dir/child</d:href>
-    <d:propstat>
-      <d:prop>
-        <d:resourcetype/>
-        <d:displayname>child</d:displayname>
-      </d:prop>
-      <d:status>HTTP/1.1 200 OK</d:status>
-    </d:propstat>
-  </d:response>
-</d:multistatus>
-''';
-      final files = WebdavFile.parseFiles('/dir/', xml, skipSelf: true);
-      expect(files.length, 1);
-      expect(files.first.name, 'child');
-    });
-
-    test('non-collection href with trailing slash gets it stripped (line 308)',
-        () {
-      const xml = '''
-<?xml version="1.0" encoding="utf-8"?>
-<d:multistatus xmlns:d="DAV:">
-  <d:response>
-    <d:href>/base/</d:href>
-    <d:propstat>
-      <d:prop>
-        <d:resourcetype><d:collection/></d:resourcetype>
-        <d:displayname>base</d:displayname>
-      </d:prop>
-      <d:status>HTTP/1.1 200 OK</d:status>
-    </d:propstat>
-  </d:response>
-  <d:response>
-    <d:href>/base/file/</d:href>
-    <d:propstat>
-      <d:prop>
-        <d:resourcetype/>
-        <d:displayname>file</d:displayname>
-      </d:prop>
-      <d:status>HTTP/1.1 200 OK</d:status>
-    </d:propstat>
-  </d:response>
-</d:multistatus>
-''';
-      // '/base/file/' is non-collection (no <collection/>), length > 1, ends with /
-      // _normalizeHrefForComparison should strip trailing /
-      final files = WebdavFile.parseFiles('/base/', xml, skipSelf: true);
-      expect(files.length, 1);
-      expect(files.first.name, 'file');
     });
   });
 }

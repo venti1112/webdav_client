@@ -144,7 +144,7 @@ extension WebdavClientPropfind on WebdavClient {
     if (lockToken != null || etag != null) {
       final ifHeader = _buildIfHeader(url, path, lockToken, etag, notTag);
       if (ifHeader.isNotEmpty) {
-        _setHeaderCaseInsensitive(requestHeaders, 'If', ifHeader);
+        requestHeaders['If'] = ifHeader;
       }
     }
 
@@ -171,7 +171,7 @@ extension WebdavClientPropfind on WebdavClient {
     final requestHeaders = headers != null
         ? Map<String, dynamic>.from(headers)
         : <String, dynamic>{};
-    _setHeaderCaseInsensitive(requestHeaders, 'If-None-Match', '*');
+    requestHeaders['If-None-Match'] = '*';
 
     return _client.wdWriteWithBytes(
       path,
@@ -194,11 +194,7 @@ extension WebdavClientPropfind on WebdavClient {
     final requestHeaders = headers != null
         ? Map<String, dynamic>.from(headers)
         : <String, dynamic>{};
-    _setHeaderCaseInsensitive(
-      requestHeaders,
-      'If-Match',
-      _formatEntityTag(etag),
-    );
+    requestHeaders['If-Match'] = _formatEntityTag(etag);
 
     return _client.wdWriteWithBytes(
       path,
@@ -228,56 +224,38 @@ extension WebdavClientPropfind on WebdavClient {
     xmlBuilder.element('d:propertyupdate', nest: () {
       xmlBuilder.namespaceUri('d', 'DAV:');
 
-      // Resolve set and remove lists in a single pass so auto-assigned
-      // prefixes (ns0, ns1, ...) are allocated consistently across both
-      // lists; resolving them separately can map the same prefix to two
-      // different URIs in the generated PROPPATCH.
-      final setKeys = setProps?.keys.toList(growable: false) ?? const [];
-      final removeList = removeProps ?? const <String>[];
-      final combined = <String>[...setKeys, ...removeList];
-      final combinedResolution =
-          combined.isEmpty ? null : resolvePropertyNames(
-        combined,
+      final setEntries = setProps?.entries.toList() ?? const [];
+      final removeNames = removeProps ?? const <String>[];
+      // Resolve together so set and remove never share an auto prefix.
+      final resolution = resolvePropertyNames(
+        [...setEntries.map((e) => e.key), ...removeNames],
         namespaceMap: namespaces,
       );
-      final setResolution = combinedResolution == null || setKeys.isEmpty
-          ? null
-          : _splitResolution(combinedResolution, 0, setKeys.length);
-      final removeResolution = combinedResolution == null || removeList.isEmpty
-          ? null
-          : _splitResolution(
-              combinedResolution,
-              setKeys.length,
-              setKeys.length + removeList.length,
-            );
+      final setResolved = resolution.properties.sublist(0, setEntries.length);
+      final removeResolved = resolution.properties.sublist(setEntries.length);
 
-      final namespaceDeclarations = <String, String>{};
-      if (combinedResolution != null) {
-        namespaceDeclarations.addAll(combinedResolution.namespaces);
-      }
-
-      namespaceDeclarations.forEach((prefix, uri) {
+      resolution.namespaces.forEach((prefix, uri) {
         if (prefix == 'd') return;
         xmlBuilder.namespaceUri(prefix, uri);
       });
 
-      if (setResolution != null) {
-        final entries = setProps!.entries.toList();
+      if (setResolved.isNotEmpty) {
         xmlBuilder.element('d:set', nest: () {
           xmlBuilder.element('d:prop', nest: () {
-            for (var i = 0; i < setResolution.properties.length; i++) {
-              final prop = setResolution.properties[i];
-              final value = entries[i].value;
-              xmlBuilder.element(prop.qualifiedName, nest: value);
+            for (var i = 0; i < setResolved.length; i++) {
+              xmlBuilder.element(
+                setResolved[i].qualifiedName,
+                nest: setEntries[i].value,
+              );
             }
           });
         });
       }
 
-      if (removeResolution != null) {
+      if (removeResolved.isNotEmpty) {
         xmlBuilder.element('d:remove', nest: () {
           xmlBuilder.element('d:prop', nest: () {
-            for (final prop in removeResolution.properties) {
+            for (final prop in removeResolved) {
               xmlBuilder.element(prop.qualifiedName);
             }
           });
@@ -368,7 +346,7 @@ extension WebdavClientPropfind on WebdavClient {
       cancelToken: cancelToken,
     );
     final principal = props['{DAV:}current-user-principal'];
-    return _firstHrefText(principal);
+    return _firstHref(path, principal);
   }
 
   /// Discover principal collection set hrefs (RFC 3744 §5.8).
@@ -383,7 +361,7 @@ extension WebdavClientPropfind on WebdavClient {
       headers: headers,
       cancelToken: cancelToken,
     );
-    return _hrefList(props['{DAV:}principal-collection-set']);
+    return _hrefs(path, props['{DAV:}principal-collection-set']);
   }
 
   /// Discover the owner principal URL for a resource (RFC 3744 §5.1).
@@ -398,7 +376,7 @@ extension WebdavClientPropfind on WebdavClient {
       headers: headers,
       cancelToken: cancelToken,
     );
-    return _firstHrefText(props['{DAV:}owner']);
+    return _firstHref(path, props['{DAV:}owner']);
   }
 
   /// Discover group membership hrefs for a principal (RFC 3744 §5.4).
@@ -414,7 +392,7 @@ extension WebdavClientPropfind on WebdavClient {
       cancelToken: cancelToken,
     );
     final element = props['{DAV:}group-membership'];
-    return _hrefList(element);
+    return _hrefs(path, element);
   }
 
   /// Discover ACL restrictions for [path] (RFC 3744 §5.5.1).
@@ -444,7 +422,7 @@ extension WebdavClientPropfind on WebdavClient {
       headers: headers,
       cancelToken: cancelToken,
     );
-    return _hrefList(props['{DAV:}group-member-set']);
+    return _hrefs(path, props['{DAV:}group-member-set']);
   }
 
   /// Discover current-user-privilege-set values for [path] (RFC 3744 §5.5).
@@ -464,8 +442,7 @@ extension WebdavClientPropfind on WebdavClient {
       return const <String>[];
     }
 
-    return element
-        .findAllElements('privilege', namespaceUri: '*')
+    return davChildren(element, 'privilege')
         .expand((privilege) => privilege.childElements)
         .map(_formatPropertyName)
         .toList(growable: false);
@@ -487,7 +464,7 @@ extension WebdavClientPropfind on WebdavClient {
     if (acl == null) {
       return const <XmlElement>[];
     }
-    return acl.findElements('ace', namespaceUri: '*').toList(growable: false);
+    return davChildren(acl, 'ace').toList(growable: false);
   }
 
   /// Discover inherited ACL set hrefs for [path] (RFC 3744 §5.6).
@@ -502,7 +479,7 @@ extension WebdavClientPropfind on WebdavClient {
       headers: headers,
       cancelToken: cancelToken,
     );
-    return _hrefList(props['{DAV:}inherited-acl-set']);
+    return _hrefs(path, props['{DAV:}inherited-acl-set']);
   }
 
   /// Discover alternate URI set values for a principal (RFC 3744 §4.2).
@@ -517,7 +494,7 @@ extension WebdavClientPropfind on WebdavClient {
       headers: headers,
       cancelToken: cancelToken,
     );
-    return _hrefList(props['{DAV:}alternate-URI-set']);
+    return _hrefs(path, props['{DAV:}alternate-URI-set']);
   }
 
   /// Discover principal URL values for a principal resource (RFC 3744 §4.3).
@@ -532,7 +509,7 @@ extension WebdavClientPropfind on WebdavClient {
       headers: headers,
       cancelToken: cancelToken,
     );
-    return _hrefList(props['{DAV:}principal-URL']);
+    return _hrefs(path, props['{DAV:}principal-URL']);
   }
 
   /// Discover the workspace collection set hrefs (RFC 3253 §6.2).
@@ -547,7 +524,7 @@ extension WebdavClientPropfind on WebdavClient {
       headers: headers,
       cancelToken: cancelToken,
     );
-    return _hrefList(props['{DAV:}workspace-collection-set']);
+    return _hrefs(path, props['{DAV:}workspace-collection-set']);
   }
 
   /// Discover the activity collection set hrefs (RFC 3253 §13.5).
@@ -562,7 +539,7 @@ extension WebdavClientPropfind on WebdavClient {
       headers: headers,
       cancelToken: cancelToken,
     );
-    return _hrefList(props['{DAV:}activity-collection-set']);
+    return _hrefs(path, props['{DAV:}activity-collection-set']);
   }
 
   /// Discover creation user display name (RFC 3253 §3.1.1).
@@ -609,7 +586,7 @@ extension WebdavClientPropfind on WebdavClient {
       headers: headers,
       cancelToken: cancelToken,
     );
-    return _hrefList(props['{DAV:}source']);
+    return _hrefs(path, props['{DAV:}source']);
   }
 
   /// Discover the checked-in version href for a version-controlled resource.
@@ -624,7 +601,7 @@ extension WebdavClientPropfind on WebdavClient {
       headers: headers,
       cancelToken: cancelToken,
     );
-    return _firstHrefText(props['{DAV:}checked-in']);
+    return _firstHref(path, props['{DAV:}checked-in']);
   }
 
   /// Discover the checked-out version href for a version-controlled resource.
@@ -639,7 +616,7 @@ extension WebdavClientPropfind on WebdavClient {
       headers: headers,
       cancelToken: cancelToken,
     );
-    return _firstHrefText(props['{DAV:}checked-out']);
+    return _firstHref(path, props['{DAV:}checked-out']);
   }
 
   /// Discover the version-history href for a version-controlled resource.
@@ -654,7 +631,7 @@ extension WebdavClientPropfind on WebdavClient {
       headers: headers,
       cancelToken: cancelToken,
     );
-    return _firstHrefText(props['{DAV:}version-history']);
+    return _firstHref(path, props['{DAV:}version-history']);
   }
 
   /// Discover predecessor version hrefs for a version resource.
@@ -669,7 +646,7 @@ extension WebdavClientPropfind on WebdavClient {
       headers: headers,
       cancelToken: cancelToken,
     );
-    return _hrefList(props['{DAV:}predecessor-set']);
+    return _hrefs(path, props['{DAV:}predecessor-set']);
   }
 
   /// Discover successor version hrefs for a version resource.
@@ -684,7 +661,7 @@ extension WebdavClientPropfind on WebdavClient {
       headers: headers,
       cancelToken: cancelToken,
     );
-    return _hrefList(props['{DAV:}successor-set']);
+    return _hrefs(path, props['{DAV:}successor-set']);
   }
 
   /// Discover supported method names for [path] (RFC 3253 §3.1.3).
@@ -703,8 +680,7 @@ extension WebdavClientPropfind on WebdavClient {
     if (supported == null) {
       return const <String>[];
     }
-    return supported
-        .findAllElements('supported-method', namespaceUri: '*')
+    return davChildren(supported, 'supported-method')
         .map((element) => element.getAttribute('name')?.trim())
         .whereType<String>()
         .where((name) => name.isNotEmpty)
@@ -727,9 +703,15 @@ extension WebdavClientPropfind on WebdavClient {
     if (supported == null) {
       return const <String>[];
     }
-    return supported
-        .findAllElements('supported-live-property', namespaceUri: '*')
-        .map((element) => element.childElements.firstOrNull)
+    // RFC 3253 §3.1.4 declares the child as `name` but defines `prop`; accept
+    // either wrapper as well as the property element itself.
+    return davChildren(supported, 'supported-live-property')
+        .map((element) {
+          final child = element.childElements.firstOrNull;
+          final isWrapper = child?.namespaceUri == 'DAV:' &&
+              (child?.localName == 'name' || child?.localName == 'prop');
+          return isWrapper ? child?.childElements.firstOrNull : child;
+        })
         .whereType<XmlElement>()
         .map(_formatPropertyName)
         .toList(growable: false);
@@ -759,43 +741,9 @@ extension WebdavClientPropfind on WebdavClient {
       cancelToken: cancelToken,
     );
 
-    final normalizedTarget = _normalizeHrefForPropFind(path);
-    // The request is resolved against the client's base URL before it is
-    // sent, so servers respond with collection-qualified hrefs (for example
-    // `/remote.php/dav/files/alice/file` for `path: '/file'`). Match both the
-    // caller-supplied path and the resolved server-side path.
-    final candidates = <String>{normalizedTarget};
-    try {
-      final baseUrl = url; // e.g. https://host/remote.php/dav/files/alice
-      final baseUri = Uri.parse(baseUrl);
-      final resolvedPath = Uri.parse(
-        resolveAgainstBaseUrl(baseUrl, path),
-      ).path;
-      if (baseUri.hasScheme && resolvedPath.isNotEmpty) {
-        candidates
-          ..add(_normalizeHrefForPropFind(resolvedPath))
-          ..add(_normalizeHrefForPropFind(baseUri.path + resolvedPath));
-      }
-    } on FormatException {
-      // Unparseable base URL: fall back to path-only matching below.
-    }
-
-    Map<int, Map<String, XmlElement>>? statusMap;
-    for (final candidate in candidates) {
-      statusMap = raw[candidate];
-      if (statusMap != null) break;
-      statusMap = raw[_normalizeHrefForPropFind(candidate)];
-      if (statusMap != null) break;
-    }
-    statusMap ??= raw.entries
-        .firstWhereOrNull(
-          (entry) => candidates.contains(_normalizeHrefForPropFind(entry.key)),
-        )
+    final statusMap = raw.entries
+        .firstWhereOrNull((entry) => _isTarget(entry.key, path))
         ?.value;
-
-    if (statusMap == null && raw.length == 1) {
-      statusMap = raw.values.single;
-    }
     if (statusMap == null) {
       return const <String, XmlElement>{};
     }
@@ -875,16 +823,12 @@ extension WebdavClientPropfind on WebdavClient {
     final result = <String, Map<String, XmlElement>>{};
     raw.forEach((href, statusMap) {
       final props = <String, XmlElement>{};
-      var hasSuccess = false;
       statusMap.forEach((status, statusProps) {
         if (status >= 200 && status < 300) {
-          hasSuccess = true;
           props.addAll(statusProps);
         }
       });
-      // Preserve every resource with a successful status, even when the
-      // server reports no properties for it.
-      if (hasSuccess) {
+      if (props.isNotEmpty) {
         result[href] = props;
       }
     });
@@ -918,17 +862,19 @@ extension WebdavClientPropfind on WebdavClient {
       headers: headers,
     );
 
-    final str = resp.data;
-    if (str == null) {
-      throw WebdavException(
-        message: 'No data returned',
-        statusCode: resp.statusCode,
-        statusMessage: resp.statusMessage,
-        response: resp,
-      );
-    }
-
-    final rawMap = parseMultiStatusToMap(str);
+    final rawMap = _parseXmlBody(
+      resp,
+      'PROPFIND',
+      (body) => parseMultiStatusToMap(
+        body,
+        keyOf: (response) => switch (_options.pathMode) {
+          _ when response.rawHref.isEmpty => '',
+          PathMode.baseRelative =>
+            _hrefTarget(response.rawHref, requestPath: path),
+          PathMode.legacy => response.href,
+        },
+      ),
+    );
     if (rawMap.isEmpty) {
       return const {};
     }
@@ -956,67 +902,29 @@ extension WebdavClientPropfind on WebdavClient {
   }
 }
 
-String? _firstHrefText(XmlElement? element) {
-  return _hrefList(element).firstOrNull;
+final _schemeAuthorityReg = RegExp('^[A-Za-z][A-Za-z0-9+.-]*://[^/]*');
+
+// TODO: remove with the legacy path mode.
+/// Whether a once-decoded response href names the resolved request [target],
+/// which may carry the base URL's path. `Uri.path` stays percent-encoded, so
+/// decoding it here is the single decode for the target too.
+bool _hrefIsTarget(String decodedHref, Uri target) =>
+    _hrefOriginMatches(decodedHref, target) &&
+    _hrefPathKey(decodedHref) == _hrefPathKey(decodeHref(target.path));
+
+/// Whether an absolute [decodedHref] names the same origin as [target]; a
+/// path-only href always does.
+bool _hrefOriginMatches(String decodedHref, Uri target) {
+  final origin = _schemeAuthorityReg.firstMatch(decodedHref)?[0];
+  if (origin == null) return true;
+  final uri = Uri.tryParse(origin);
+  return uri != null && sameOrigin(uri, target);
 }
 
-List<String> _hrefList(XmlElement? element) {
-  if (element == null) {
-    return const <String>[];
-  }
-  return element
-      .findAllElements('href', namespaceUri: '*')
-      .map((href) => href.innerText.trim())
-      .where((href) => href.isNotEmpty)
-      .toList(growable: false);
-}
-
-String _normalizeHrefForPropFind(String href) {
-  if (href.isEmpty) {
-    return href;
-  }
-  try {
-    final uri = Uri.parse(href);
-    final path =
-        uri.hasScheme || uri.hasAuthority || uri.hasQuery || uri.hasFragment
-            ? uri.path
-            : href;
-    return _decodePropFindHref(path);
-  } on FormatException {
-    return _decodePropFindHref(href);
-  }
-}
-
-String _decodePropFindHref(String href) {
-  try {
-    return Uri.decodeFull(href);
-  } on FormatException {
-    return href;
-  }
-}
-
-/// Split a combined [PropertyResolutionResult] into a sub-range of the
-/// resolved properties, preserving their shared namespace declarations.
-PropertyResolutionResult _splitResolution(
-  PropertyResolutionResult resolution,
-  int start,
-  int end,
-) {
-  return PropertyResolutionResult(
-    properties: resolution.properties.sublist(start, end),
-    namespaces: resolution.namespaces,
-  );
-}
-
-/// Set [name] in [headers], removing any existing entry with the same name
-/// (case-insensitively) first so generated conditions never duplicate
-/// caller-supplied headers with a different casing.
-void _setHeaderCaseInsensitive(
-  Map<String, dynamic> headers,
-  String name,
-  dynamic value,
-) {
-  final lower = name.toLowerCase();
-  headers.removeWhere((key, _) => key.toLowerCase() == lower);
-  headers[name] = value;
+/// Path of a decoded href without scheme, authority or trailing slash.
+String _hrefPathKey(String decodedHref) {
+  final path = decodedHref.replaceFirst(_schemeAuthorityReg, '');
+  return path.length > 1 && path.endsWith('/')
+      ? path.substring(0, path.length - 1)
+      : path;
 }

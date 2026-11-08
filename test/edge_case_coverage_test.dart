@@ -30,7 +30,7 @@ void main() {
 
       final tmpDir = await Directory.systemTemp.createTemp('wd_auth_fail_');
       addTearDown(() async {
-        if (await tmpDir.exists()) await tmpDir.delete(recursive: true);
+        if (tmpDir.existsSync()) await tmpDir.delete(recursive: true);
       });
 
       // The 401 in req() triggers WebdavException, which is caught
@@ -54,7 +54,7 @@ void main() {
 
       final tmpDir = await Directory.systemTemp.createTemp('wd_forbidden_');
       addTearDown(() async {
-        if (await tmpDir.exists()) await tmpDir.delete(recursive: true);
+        if (tmpDir.existsSync()) await tmpDir.delete(recursive: true);
       });
 
       expect(
@@ -76,7 +76,7 @@ void main() {
 
       final tmpDir = await Directory.systemTemp.createTemp('wd_server_err_');
       addTearDown(() async {
-        if (await tmpDir.exists()) await tmpDir.delete(recursive: true);
+        if (tmpDir.existsSync()) await tmpDir.delete(recursive: true);
       });
 
       expect(
@@ -105,6 +105,7 @@ void main() {
 
       final client = WebdavClient.noAuth(
         url: 'http://${server.address.host}:${server.port}',
+        options: const WebdavOptions(pathMode: PathMode.legacy),
       );
 
       // 'http://[' causes Uri.parse to throw, triggering _serverPathFromTarget

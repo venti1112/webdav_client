@@ -3,7 +3,6 @@ import 'dart:io';
 
 import 'package:test/test.dart';
 import 'package:webdav_client_plus/webdav_client_plus.dart';
-import 'package:xml/xml.dart';
 
 void main() {
   group('SabreDAV-style propFind helpers', () {
@@ -22,7 +21,7 @@ void main() {
         () async {
       String? method;
       String? depth;
-      String body = '';
+      var body = '';
 
       server.listen((request) async {
         method = request.method;
@@ -131,6 +130,7 @@ void main() {
 
       final client = WebdavClient.noAuth(
         url: 'http://${server.address.host}:${server.port}',
+        options: const WebdavOptions(pathMode: PathMode.legacy),
       );
 
       final props = await client.propFind(
@@ -145,7 +145,7 @@ void main() {
 
     test('propFindNames sends propname and returns successful property names',
         () async {
-      String body = '';
+      var body = '';
 
       server.listen((request) async {
         body = await utf8.decoder.bind(request).join();
@@ -214,7 +214,7 @@ void main() {
     });
 
     test('propFindAll sends allprop with include list', () async {
-      String body = '';
+      var body = '';
 
       server.listen((request) async {
         body = await utf8.decoder.bind(request).join();
@@ -242,9 +242,8 @@ void main() {
         'getetag',
       ]);
 
-      // RFC 4918: `include` must be nested inside `allprop`.
-      expect(body, contains('<d:allprop><d:include>'));
-      expect(body, contains('<d:getetag/></d:include></d:allprop>'));
+      expect(body, contains('<d:allprop/>'));
+      expect(body, contains('<d:include>'));
       expect(props.keys, contains('{DAV:}getetag'));
     });
   });

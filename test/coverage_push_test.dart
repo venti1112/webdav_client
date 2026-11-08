@@ -84,9 +84,9 @@ void main() {
       expect(
         () => client.read('/no-location'),
         throwsA(isA<WebdavException>().having(
-          (e) => e.statusCode,
-          'statusCode',
-          301,
+          (e) => e.message,
+          'message',
+          contains('No location header'),
         )),
       );
     });
@@ -239,7 +239,7 @@ void main() {
 
       final tmpDir = await Directory.systemTemp.createTemp('webdav_null_');
       addTearDown(() async {
-        if (await tmpDir.exists()) await tmpDir.delete(recursive: true);
+        if (tmpDir.existsSync()) await tmpDir.delete(recursive: true);
       });
 
       // This should either work (empty file) or throw

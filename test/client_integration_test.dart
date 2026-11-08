@@ -2,7 +2,6 @@ import 'dart:convert';
 import 'dart:io';
 import 'dart:typed_data';
 
-import 'package:dio/dio.dart';
 import 'package:test/test.dart';
 import 'package:webdav_client_plus/webdav_client_plus.dart';
 
@@ -737,7 +736,7 @@ void main() {
 
       final tmpDir = await Directory.systemTemp.createTemp('webdav_stream_');
       addTearDown(() async {
-        if (await tmpDir.exists()) {
+        if (tmpDir.existsSync()) {
           await tmpDir.delete(recursive: true);
         }
       });
@@ -746,7 +745,7 @@ void main() {
       await client.readFile('/stream-file', savePath);
 
       final file = File(savePath);
-      expect(await file.exists(), isTrue);
+      expect(file.existsSync(), isTrue);
       expect(await file.readAsBytes(), [10, 20, 30, 40, 50]);
     });
 
@@ -767,7 +766,7 @@ void main() {
 
       final tmpDir = await Directory.systemTemp.createTemp('webdav_progress_');
       addTearDown(() async {
-        if (await tmpDir.exists()) {
+        if (tmpDir.existsSync()) {
           await tmpDir.delete(recursive: true);
         }
       });
@@ -795,7 +794,7 @@ void main() {
 
       final tmpDir = await Directory.systemTemp.createTemp('webdav_throw_');
       addTearDown(() async {
-        if (await tmpDir.exists()) {
+        if (tmpDir.existsSync()) {
           await tmpDir.delete(recursive: true);
         }
       });
@@ -822,7 +821,7 @@ void main() {
 
       final tmpDir = await Directory.systemTemp.createTemp('webdav_nocl_');
       addTearDown(() async {
-        if (await tmpDir.exists()) {
+        if (tmpDir.existsSync()) {
           await tmpDir.delete(recursive: true);
         }
       });
@@ -964,7 +963,7 @@ void main() {
 
       final tmpDir = await Directory.systemTemp.createTemp('webdav_upload_');
       addTearDown(() async {
-        if (await tmpDir.exists()) {
+        if (tmpDir.existsSync()) {
           await tmpDir.delete(recursive: true);
         }
       });
@@ -997,7 +996,7 @@ void main() {
       final tmpDir =
           await Directory.systemTemp.createTemp('webdav_upload_fail_');
       addTearDown(() async {
-        if (await tmpDir.exists()) {
+        if (tmpDir.existsSync()) {
           await tmpDir.delete(recursive: true);
         }
       });
@@ -1038,32 +1037,54 @@ void main() {
       );
     });
 
-    test('throws when readDir returns null data', () async {
-      server.listen((request) async {
-        await request.drain();
-        request.response.statusCode = HttpStatus.multiStatus;
-        await request.response.close();
+    group('207 without a usable body', () {
+      late WebdavClient client;
+      late String body;
+
+      setUp(() {
+        server.listen((request) async {
+          await request.drain();
+          request.response
+            ..statusCode = HttpStatus.multiStatus
+            ..write(body);
+          await request.response.close();
+        });
+        client = WebdavClient.noAuth(
+          url: 'http://${server.address.host}:${server.port}',
+        );
       });
 
-      // readDir will call wdPropfind which expects text response
-      // null data depends on Dio behavior - may or may not be testable
-    });
+      final calls = <String, Future<Object?> Function(WebdavClient)>{
+        'readDir': (c) => c.readDir('/'),
+        'readProps': (c) => c.readProps('/empty'),
+        'propFind': (c) => c.propFind('/empty'),
+        'quotaBytes': (c) => c.quotaBytes(),
+      };
+      for (final MapEntry(key: name, value: call) in calls.entries) {
+        test('$name reports an empty body as WebdavException', () async {
+          body = '';
+          await expectLater(
+            call(client),
+            throwsA(isA<WebdavException>().having(
+              (e) => e.message,
+              'message',
+              contains('did not include a multi-status body'),
+            )),
+          );
+        });
 
-    test('throws when readProps returns null data', () async {
-      server.listen((request) async {
-        await request.drain();
-        request.response.statusCode = HttpStatus.multiStatus;
-        await request.response.close();
-      });
-
-      final client = WebdavClient.noAuth(
-        url: 'http://${server.address.host}:${server.port}',
-      );
-
-      expect(
-        () => client.readProps('/empty'),
-        throwsA(anything),
-      );
+        test('$name reports malformed XML as WebdavException', () async {
+          body = 'not-xml';
+          await expectLater(
+            call(client),
+            throwsA(isA<WebdavException>().having(
+              (e) => e.message,
+              'message',
+              contains('Unable to parse PROPFIND response'),
+            )),
+          );
+        });
+      }
     });
   });
 
@@ -1952,6 +1973,7 @@ void main() {
 
       final client = WebdavClient.noAuth(
         url: 'http://${server.address.host}:${server.port}',
+        options: const WebdavOptions(pathMode: PathMode.legacy),
       );
 
       await client.request<String>(

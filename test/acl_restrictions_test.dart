@@ -2,7 +2,6 @@ import 'dart:io';
 
 import 'package:test/test.dart';
 import 'package:webdav_client_plus/webdav_client_plus.dart';
-import 'package:xml/xml.dart';
 
 void main() {
   test('aclRestrictions returns acl-restrictions element', () async {
@@ -33,13 +32,10 @@ void main() {
     final restrictions = await client.aclRestrictions(path: '/file.txt');
 
     expect(restrictions, isNotNull);
-expect(
+    expect(
       restrictions!.findElements('required-principal', namespaceUri: '*'),
       isNotEmpty,
     );
-    expect(
-      restrictions.findElements('no-invert', namespaceUri: '*'),
-      isNotEmpty,
-    );
+    expect(restrictions.findElements('no-invert', namespaceUri: '*'), isNotEmpty);
   });
 }

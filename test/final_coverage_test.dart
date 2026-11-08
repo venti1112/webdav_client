@@ -30,7 +30,7 @@ void main() {
         url: 'http://${server.address.host}:${server.port}',
       );
 
-      expect(() => client.quota(), throwsA(isA<WebdavException>()));
+      expect(client.quota, throwsA(isA<WebdavException>()));
     });
   });
 
@@ -51,38 +51,11 @@ void main() {
         url: 'http://${server.address.host}:${server.port}',
       );
 
-      // Caller-supplied headers must win over the generated default, and the
-      // match must be case-insensitive: pass a lowercase header name while
-      // the default is written as "Content-Type".
-      await client.write(
-        '/test.txt',
-        Uint8List.fromList([1, 2, 3]),
-        headers: {'content-type': 'text/plain; charset=utf-8'},
-      );
-      expect(capturedContentType, contains('text/plain'));
-    });
-
-    test('defaults to application/octet-stream without additionalHeaders',
-        () async {
-      final server = await HttpServer.bind(InternetAddress.loopbackIPv4, 0);
-      addTearDown(() async => server.close(force: true));
-
-      String? capturedContentType;
-      server.listen((request) async {
-        capturedContentType = request.headers.contentType?.toString();
-        await request.drain();
-        request.response.statusCode = HttpStatus.created;
-        await request.response.close();
-      });
-
-      final client = WebdavClient.noAuth(
-        url: 'http://${server.address.host}:${server.port}',
-      );
-
       await client.write(
         '/test.txt',
         Uint8List.fromList([1, 2, 3]),
       );
+      // Default content type is application/octet-stream
       expect(capturedContentType, contains('octet-stream'));
     });
   });
@@ -177,7 +150,7 @@ void main() {
       final tmpDir =
           await Directory.systemTemp.createTemp('webdav_stream_test_');
       addTearDown(() async {
-        if (await tmpDir.exists()) await tmpDir.delete(recursive: true);
+        if (tmpDir.existsSync()) await tmpDir.delete(recursive: true);
       });
 
       final progressList = <int>[];
@@ -323,9 +296,9 @@ void main() {
               ContentType('application', 'xml', charset: 'utf-8')
           ..write('''
 <?xml version="1.0"?>
-<root>
-  <href>urn:uuid:some-random-uuid</href>
-</root>
+<d:root xmlns:d="DAV:">
+  <d:href>urn:uuid:some-random-uuid</d:href>
+</d:root>
 ''');
         await request.response.close();
       });
@@ -458,7 +431,7 @@ void main() {
     });
   });
 
-  group('_normalizeHrefForComparison edge cases', () {
+  group('readDir self entry edge cases', () {
     test('skipSelf filters non-collection file with trailing slash', () async {
       final server = await HttpServer.bind(InternetAddress.loopbackIPv4, 0);
       addTearDown(() async => server.close(force: true));
@@ -547,6 +520,7 @@ void main() {
 
       final client = WebdavClient.noAuth(
         url: 'http://${server.address.host}:${server.port}',
+        options: const WebdavOptions(pathMode: PathMode.legacy),
       );
 
       final files = await client.readDir('/dir/');

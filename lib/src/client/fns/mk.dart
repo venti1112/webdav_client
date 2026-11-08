@@ -25,7 +25,7 @@ extension WebdavClientMk on WebdavClient {
       ifHeader: ifHeader,
       headers: headers,
     );
-    var status = resp.statusCode;
+    final status = resp.statusCode;
     if (status != 201 && status != 405) {
       throw _newResponseError(resp);
     }
@@ -99,13 +99,22 @@ extension WebdavClientMk on WebdavClient {
       return;
     }
     if (status == 409) {
-      final pathOnly = path.split('?').first.split('#').first;
+      final String pathOnly;
+      switch (_options.pathMode) {
+        case PathMode.baseRelative:
+          pathOnly = hrefToTarget(url, absoluteUrl(path));
+          // Collections outside the base URL are not created one by one.
+          if (!pathOnly.startsWith('/')) throw _newResponseError(resp);
+        // TODO: remove with the legacy path mode.
+        case PathMode.legacy:
+          pathOnly = path.split('?').first.split('#').first;
+      }
       final paths = pathOnly.split('/').where((segment) => segment.isNotEmpty);
-      var sub = '/';
-      for (var e in paths) {
-        sub += '$e/';
+      final sub = StringBuffer('/');
+      for (final e in paths) {
+        sub.write('$e/');
         final resp = await _client.wdMkcol(
-          sub,
+          sub.toString(),
           cancelToken: cancelToken,
           ifHeader: ifHeader,
           headers: headers,

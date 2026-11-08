@@ -23,22 +23,14 @@ class WebdavException<T extends Object?> implements Exception {
   String toString() {
     final status = statusCode ?? 'unknown';
     final reason = statusMessage ?? '';
-    final body = response?.data;
-    if (body is String && body.isNotEmpty) {
-      final preview = body.length <= 200 ? body : '${body.substring(0, 200)}...';
-      final previewFormatted = preview.replaceAll('\n', ' ');
-      return 'WebdavException: $message (Status: $status $reason):\n'
-          '$previewFormatted';
-    }
-    return 'WebdavException: $message (Status: $status $reason)';
+    return 'WebdavException: $message (Status: $status $reason):\n'
+        '${response?.data}';
   }
 
   /// Create a [WebdavException] by inspecting a raw dio [Response].
   ///
   /// WebDAV-specific status codes are mapped to descriptive messages to help
-  /// callers surface RFC 4918 guidance without re-parsing the payload. An
-  /// explicitly supplied [message] is always preserved so callers keep their
-  /// operation-specific context.
+  /// callers surface RFC 4918 guidance without re-parsing the payload.
   factory WebdavException.fromResponse(
     Response<T> response, [
     String? message,
@@ -46,7 +38,7 @@ class WebdavException<T extends Object?> implements Exception {
     final status = response.statusCode;
     final statusMessage = response.statusMessage;
 
-    String errorMessage = message ?? 'WebDAV operation failed';
+    var errorMessage = message ?? 'WebDAV operation failed';
 
     // RFC 4918: normalise well-known WebDAV status codes into actionable
     // diagnostics so callers receive consistent guidance when debugging
@@ -57,45 +49,27 @@ class WebdavException<T extends Object?> implements Exception {
         try {
           final body = response.data;
           if (body is! String) {
-            errorMessage = message ?? 'Multi-Status response with errors';
+            errorMessage = 'Multi-Status response with errors';
             break;
           }
 
           final xmlDoc = XmlDocument.parse(body);
-          // Only DAV: `<error>` elements that are direct children of a
-          // `response` element are protocol errors; nested extension XML in
-          // property values must not be misclassified.
-          final errorElements = xmlDoc.rootElement.childElements
-              .where((element) => element.name.local == 'response')
-              .expand(
-                (responseElement) => responseElement.childElements.where(
-                  (element) =>
-                      element.name.local == 'error' &&
-                      element.name.namespaceUri == 'DAV:',
-                ),
-              )
-              .toList();
+          final errorElements = xmlDoc.findAllElements('error', namespaceUri: 'DAV:');
           if (errorElements.isNotEmpty) {
             // Check common WebDAV preconditions/postconditions codes
             for (final errorElement in errorElements) {
               // Lookup for lock-token-submitted
-              if (errorElement
-                  .findElements('lock-token-submitted', namespaceUri: '*')
-                  .isNotEmpty) {
+              if (davChild(errorElement, 'lock-token-submitted') != null) {
                 return WebdavException(
-                  message: message ??
-                      'Resource is locked and requires a valid lock token',
+                  message: 'Resource is locked and requires a valid lock token',
                   statusCode: status,
                   statusMessage: statusMessage,
                   response: response,
                 );
               }
-              if (errorElement
-                  .findElements('no-conflicting-lock', namespaceUri: '*')
-                  .isNotEmpty) {
+              if (davChild(errorElement, 'no-conflicting-lock') != null) {
                 return WebdavException(
-                  message: message ??
-                      'The resource has a conflicting lock',
+                  message: 'The resource has a conflicting lock',
                   statusCode: status,
                   statusMessage: statusMessage,
                   response: response,
@@ -103,68 +77,54 @@ class WebdavException<T extends Object?> implements Exception {
               }
             }
 
-            errorMessage = message ?? _formatDavErrorElement(errorElements.first);
+            errorMessage = _formatDavErrorElement(errorElements.first);
             break;
           }
 
           final failures = parseMultiStatusFailureMessages(body);
           if (failures.isNotEmpty) {
-            errorMessage = message ?? failures.join('; ');
+            errorMessage = failures.join('; ');
             break;
           }
         } catch (_) {
-          errorMessage = message ?? 'Multi-Status response with errors';
+          errorMessage = 'Multi-Status response with errors';
         }
-        break;
       case 422:
         // Unprocessable Entity (RFC 4918 §11.2 / §16).
-        errorMessage = message ??
-            'Unprocessable Entity: The server understands the '
-                'content type but was unable to process the contained instructions';
-        break;
+        errorMessage = 'Unprocessable Entity: The server understands the '
+            'content type but was unable to process the contained instructions';
       case 423:
         // Locked (RFC 4918 §11.3).
-        errorMessage = message ?? 'Resource is locked';
-        break;
+        errorMessage = 'Resource is locked';
       case 424:
         // Failed Dependency (RFC 4918 §11.4).
-        errorMessage = message ??
-            'Failed dependency: The method could not be performed '
-                'because the requested action depended on another action that failed';
-        break;
+        errorMessage = 'Failed dependency: The method could not be performed '
+            'because the requested action depended on another action that failed';
       case 507:
         // Insufficient Storage (RFC 4918 §11.5).
-        errorMessage = message ?? 'Insufficient storage';
-        break;
+        errorMessage = 'Insufficient storage';
       case 508:
         // Loop Detected (RFC 5842 §7.2).
-        errorMessage = message ??
+        errorMessage =
             'Loop detected: The binding graph contains a cycle for this request';
-        break;
       // Other common status codes
       case 401:
         // HTTP 401 (RFC 7235 §3.1) — authentication challenge.
-        errorMessage = message ?? 'Authentication required';
-        break;
+        errorMessage = 'Authentication required';
       case 403:
         // HTTP 403 (RFC 7231 §6.5.3) — permissions issue.
-        errorMessage = message ?? 'Access forbidden';
-        break;
+        errorMessage = 'Access forbidden';
       case 404:
         // HTTP 404 (RFC 7231 §6.5.4) — resource missing.
-        errorMessage = message ?? 'Resource not found';
-        break;
+        errorMessage = 'Resource not found';
       case 409:
         // HTTP 409 (RFC 7231 §6.5.8) — conflict with current state.
-        errorMessage = message ??
-            'Conflict: The request could not be completed due to a '
-                'conflict with the current state of the resource';
-        break;
+        errorMessage = 'Conflict: The request could not be completed due to a '
+            'conflict with the current state of the resource';
       case 412:
         // HTTP 412 (RFC 7232 §4.2) — conditional headers failed.
-        errorMessage = message ??
+        errorMessage =
             'Precondition failed: One of the conditions specified in the request header failed';
-        break;
     }
 
     return WebdavException(
@@ -194,5 +154,24 @@ String _formatDavErrorElement(XmlElement errorElement) {
 /// Helper to ensure we always translate dio errors into [WebdavException].
 WebdavException<T> _newResponseError<T extends Object?>(Response<T> resp,
     [String? message]) {
+  if (message == null && _isUnfollowableRedirect(resp)) {
+    return WebdavException.fromResponse(resp, 'No location header found');
+  }
   return WebdavException.fromResponse(resp, message);
+}
+
+/// A 3xx that the transport could not follow because the server omitted the
+/// `Location` header, leaving nothing for the caller to act on.
+bool _isUnfollowableRedirect(Response<Object?> resp) {
+  switch (resp.statusCode) {
+    case 301:
+    case 302:
+    case 303:
+    case 307:
+    case 308:
+      final locations = resp.headers['location'];
+      return locations == null || locations.isEmpty;
+    default:
+      return false;
+  }
 }

@@ -1,4 +1,5 @@
 import 'package:webdav_client_plus/src/enums.dart';
+import 'package:webdav_client_plus/src/internal/path_utils.dart';
 import 'package:webdav_client_plus/src/internal/xml_utils.dart';
 import 'package:xml/xml.dart';
 
@@ -70,92 +71,68 @@ class WebdavFile {
 
   /// Parse a WebDAV XML response to a list of WebdavFile objects
   ///
-  /// - [path] is the base path of the files
   /// - [xmlStr] is the XML response from the server
-  /// - [skipSelf] is a flag to skip the first entry (self) in the response
+  /// - [toPath] converts each response href, as sent by the server, to
+  ///   [WebdavFile.path], or returns `null` to skip the entry
   static List<WebdavFile> parseFiles(
-    String path,
-    String xmlStr, {
-    bool skipSelf = true,
-  }) {
+    String xmlStr,
+    String? Function(String href) toPath,
+  ) {
     final files = <WebdavFile>[];
     final xmlDocument = XmlDocument.parse(xmlStr);
-    final responseElements = findAllElements(xmlDocument, 'response');
-
-    final normalizedBaseHref = skipSelf
-        ? _normalizeHrefForComparison(
-            path,
-            treatAsCollection: path.trim().isEmpty || path.trim().endsWith('/'),
-          )
-        : null;
-
-    for (final response in responseElements) {
-      final href = getElementText(response, 'href');
+    for (final response in multiStatusResponses(xmlDocument)) {
+      final href = hrefText(response);
       if (href == null) continue;
 
-      // Find successful propstat elements and merge their properties
-      final prop = _mergeSuccessfulProps(response);
+      final propstat = _findSuccessfulPropstat(response);
+      if (propstat == null) continue;
+
+      final prop = davChild(propstat, 'prop');
       if (prop == null) continue;
 
-      final decodedHref = _decodeHrefValue(href);
-
-      if (skipSelf && normalizedBaseHref != null) {
-        final normalizedHref = _normalizeHrefForComparison(
-          decodedHref,
-          treatAsCollection: normalizedBaseHref.endsWith('/'),
-        );
-        if (normalizedHref == normalizedBaseHref) {
-          continue;
-        }
-      }
-
-      // Create WebdavFile from prop data
-      final file = parse(path, decodedHref, prop);
-      files.add(file);
+      final path = toPath(href);
+      if (path == null) continue;
+      files.add(parse(path, href, prop));
     }
-
     return files;
   }
 
   /// Create a WebdavFile object from prop data
   ///
-  /// - [basePath] is the base path of the files
-  /// - [href] is the href of the file
+  /// - [path] becomes [WebdavFile.path]
+  /// - [href] is the href of the file as sent by the server (percent-encoded)
   /// - [prop] is the prop element of the file
   static WebdavFile parse(
-    String basePath,
+    String path,
     String href,
     XmlElement prop,
   ) {
     final isDir = _isDirectory(prop);
 
     // Extract properties
-    final mimeType = getElementText(prop, 'getcontenttype');
-    final eTag = getElementText(prop, 'getetag');
-    final size = isDir ? null : getIntValue(prop, 'getcontentlength');
+    final mimeType = _davText(prop, 'getcontenttype');
+    final eTag = _davText(prop, 'getetag');
+    final size = isDir ? null : _davInt(prop, 'getcontentlength');
 
-    // Created time
-    final cTimeStr = getElementText(prop, 'creationdate')?.trim();
-    final parsedCreation =
-        cTimeStr != null ? DateTime.tryParse(cTimeStr) : null;
-    final cTime = parsedCreation?.toLocal();
+    // RFC 4918 §15.1 specifies RFC 3339, but some servers send HTTP dates.
+    final cTimeStr = _davText(prop, 'creationdate');
+    final cTime = _parseIsoDate(cTimeStr) ?? _parseHttpDate(cTimeStr);
 
-    // Modified time
-    final mTimeStr = getElementText(prop, 'getlastmodified');
-    final mTime = _parseHttpDate(mTimeStr);
+    final mTime = _parseHttpDate(_davText(prop, 'getlastmodified'));
 
-    // Path and name
-    final decodedHref = _decodeHrefValue(href);
-    var name = getElementText(prop, 'displayname');
-
-    // If name is not found, extract from path
+    var name = _davText(prop, 'displayname');
     if (name == null || name.isEmpty) {
-      final pathParts = decodedHref.split('/');
-      name = pathParts.lastWhere((part) => part.isNotEmpty, orElse: () => '/');
+      final segment = href
+          .trim()
+          .split(RegExp('[?#]'))
+          .first
+          .split('/')
+          .lastWhere((part) => part.isNotEmpty, orElse: () => '');
+      name = segment.isEmpty ? '/' : decodeHref(segment);
     }
 
-    final quotaAvailableBytes = getIntValue(prop, 'quota-available-bytes');
-    final quotaUsedBytes = getIntValue(prop, 'quota-used-bytes');
+    final quotaAvailableBytes = _davInt(prop, 'quota-available-bytes');
+    final quotaUsedBytes = _davInt(prop, 'quota-used-bytes');
 
     // Custom properties
     final customProps = <String, String>{};
@@ -163,8 +140,9 @@ class WebdavFile {
       final localName = element.localName;
       final namespace = element.namespaceUri;
 
-      // Skip common properties
-      if (PropfindType.defaultFindProperties.contains(localName)) {
+      // Skip the DAV: properties exposed as fields
+      if (namespace == 'DAV:' &&
+          PropfindType.defaultFindProperties.contains(localName)) {
         continue;
       }
 
@@ -181,7 +159,7 @@ class WebdavFile {
     }
 
     return WebdavFile(
-      path: decodedHref,
+      path: path,
       isDir: isDir,
       name: name,
       mimeType: mimeType,
@@ -196,61 +174,68 @@ class WebdavFile {
   }
 }
 
-/// Find the successful propstat element(s) for [response] and merge their
-/// `prop` children into a single element.
-///
-/// RFC 4918 does not limit servers to a single successful propstat per
-/// response; properties may be split across several 2xx blocks. All successful
-/// blocks are merged (later blocks override earlier ones for the same
-/// property) so no metadata is lost.
-XmlElement? _mergeSuccessfulProps(XmlElement response) {
-  final mergedProps = <String, XmlElement>{};
-  for (final propstat in findElements(response, 'propstat')) {
-    final statusText = getElementText(propstat, 'status');
+/// Find the first successful propstat element
+XmlElement? _findSuccessfulPropstat(XmlElement response) {
+  for (final propstat in davChildren(response, 'propstat')) {
+    final statusText = davChild(propstat, 'status')?.innerText;
     if (statusText == null) {
       continue;
     }
 
-    final statusCode = _extractStatusCode(statusText);
+    final statusCode = parseStatusLine(statusText);
     if (statusCode != null && statusCode >= 200 && statusCode < 300) {
-      final prop = findElements(propstat, 'prop').firstOrNull;
-      if (prop == null) {
-        continue;
-      }
-      for (final child in prop.childElements) {
-        final namespaceUri = child.name.namespaceUri ?? '';
-        final key = namespaceUri.isEmpty
-            ? child.name.local
-            : '{$namespaceUri}${child.name.local}';
-        mergedProps[key] = child;
-      }
+      return propstat;
     }
   }
-  if (mergedProps.isEmpty) {
-    return null;
-  }
-
-  final merged = XmlElement(const XmlName.parts('prop'));
-  for (final property in mergedProps.values) {
-    merged.children.add(property);
-  }
-  return merged;
+  return null;
 }
 
 /// Determine if resource is a directory
-bool _isDirectory(XmlElement prop) {
-  final resourceTypes = findElements(prop, 'resourcetype');
-  return resourceTypes.isNotEmpty &&
-      hasElement(resourceTypes.first, 'collection');
+bool _isDirectory(XmlElement prop) =>
+    prop
+        .getElement('resourcetype', namespaceUri: 'DAV:')
+        ?.getElement('collection', namespaceUri: 'DAV:') !=
+    null;
+
+/// Trimmed text of the DAV: property [name] in [prop], or `null`.
+String? _davText(XmlElement prop, String name) =>
+    prop.getElement(name, namespaceUri: 'DAV:')?.innerText.trim();
+
+int? _davInt(XmlElement prop, String name) {
+  final value = _davText(prop, name);
+  return value != null ? int.tryParse(value) : null;
 }
 
-int? _extractStatusCode(String statusText) {
-  final match = RegExp(r'(\d{3})').firstMatch(statusText);
-  if (match == null) {
-    return null;
-  }
-  return int.tryParse(match.group(1)!);
+/// Parse an RFC 3339 date, whose `T` and `Z` may be lowercase (§5.6).
+DateTime? _parseIsoDate(String? value) {
+  if (value == null) return null;
+  final match = _rfc3339.firstMatch(value);
+  if (match == null) return null;
+  int part(int group) => int.parse(match[group]!);
+  final year = part(1);
+  final month = part(2);
+  final day = part(3);
+  // DateTime.parse rolls invalid fields over (Feb 30 becomes Mar 1).
+  if (month < 1 || month > 12) return null;
+  if (day < 1 || day > DateTime.utc(year, month + 1, 0).day) return null;
+  final second = part(6);
+  if (part(4) > 23 || part(5) > 59 || second > 60) return null;
+  final upper = value.toUpperCase();
+  if (second < 60) return DateTime.tryParse(upper)?.toLocal();
+
+  // RFC 3339 §5.7: a leap second can only end a UTC month, at 23:59:60Z.
+  // Seconds sit at a fixed offset in the matched format.
+  final before = DateTime.tryParse(upper.replaceRange(17, 19, '59'))?.toUtc();
+  if (before == null || before.hour != 23 || before.minute != 59) return null;
+  final after = before.add(const Duration(seconds: 1));
+  return after.day == 1 ? after.toLocal() : null;
 }
+
+/// RFC 3339 §5.6 `date-time`, with `T` and `Z` in either case.
+final _rfc3339 = RegExp(
+  r'^(\d{4})-(\d{2})-(\d{2})[Tt](\d{2}):(\d{2}):(\d{2})(?:\.\d+)?'
+  r'(?:[Zz]|[+-](?:[01]\d|2[0-3]):[0-5]\d)$',
+);
 
 /// Parse HTTP date formats accepted by RFC 9110 §5.6.7.
 DateTime? _parseHttpDate(String? httpDate) {
@@ -266,7 +251,10 @@ DateTime? _parseHttpDate(String? httpDate) {
     final day = int.parse(match.group(dayIndex)!);
     var year = int.parse(match.group(yearIndex)!);
     if (year < 100) {
-      year += year >= 70 ? 1900 : 2000;
+      // RFC 9110 §5.6.7: a year more than 50 years ahead is in the past.
+      final now = DateTime.now().toUtc().year;
+      year += now - now % 100;
+      if (year > now + 50) year -= 100;
     }
     final hour = int.parse(match.group(hourIndex)!);
     final minute = int.parse(match.group(minuteIndex)!);
@@ -317,15 +305,7 @@ DateTime? _parseHttpDate(String? httpDate) {
     return parseMatch(asctime, 2, 1, 6, 3, 4, 5);
   }
 
-  return DateTime.tryParse(value)?.toLocal();
-}
-
-String _decodeHrefValue(String href) {
-  try {
-    return Uri.decodeFull(href);
-  } on FormatException {
-    return href;
-  }
+  return _parseIsoDate(value);
 }
 
 const _monthNumbers = {
@@ -342,57 +322,3 @@ const _monthNumbers = {
   'nov': 11,
   'dec': 12,
 };
-
-String _normalizeHrefForComparison(
-  String href, {
-  required bool treatAsCollection,
-}) {
-  var value = href.trim();
-  if (value.isEmpty) {
-    return treatAsCollection ? '/' : '/';
-  }
-
-  Uri? parsed;
-  try {
-    parsed = Uri.parse(value);
-  } catch (_) {
-    parsed = null;
-  }
-
-  if (parsed != null) {
-    if (parsed.hasScheme || value.startsWith('/')) {
-      value = parsed.path;
-    } else if (parsed.path.isNotEmpty) {
-      value = parsed.path;
-    }
-  }
-
-  final queryIndex = value.indexOf('?');
-  if (queryIndex != -1) {
-    value = value.substring(0, queryIndex);
-  }
-
-  final fragmentIndex = value.indexOf('#');
-  if (fragmentIndex != -1) {
-    value = value.substring(0, fragmentIndex);
-  }
-
-  if (!value.startsWith('/')) {
-    value = '/$value';
-  }
-
-  value = value.replaceAll(RegExp(r'/+'), '/');
-  if (value.isEmpty) {
-    value = '/';
-  }
-
-  if (treatAsCollection) {
-    if (!value.endsWith('/')) {
-      value = '$value/';
-    }
-  } else if (value.length > 1 && value.endsWith('/')) {
-    value = value.substring(0, value.length - 1);
-  }
-
-  return value;
-}

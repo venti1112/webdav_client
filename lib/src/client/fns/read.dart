@@ -32,17 +32,11 @@ extension WebdavClientRead on WebdavClient {
       headers: headers,
     );
 
-    final str = resp.data;
-    if (str == null) {
-      throw WebdavException(
-        message: 'No data returned',
-        statusCode: resp.statusCode,
-        statusMessage: resp.statusMessage,
-        response: resp,
-      );
-    }
-
-    return WebdavFile.parseFiles(path, str);
+    return _parseXmlBody(
+      resp,
+      'PROPFIND',
+      (body) => _parseFiles(body, path, skipSelf: true),
+    );
   }
 
   /// Read a single files properties
@@ -59,8 +53,6 @@ extension WebdavClientRead on WebdavClient {
     Map<String, String> namespaces = const <String, String>{},
     Map<String, dynamic>? headers,
   }) async {
-    // path = _fixSlashes(path);
-
     final xmlStr = findType.buildXmlStr(
       properties,
       namespaceMap: namespaces,
@@ -74,17 +66,13 @@ extension WebdavClientRead on WebdavClient {
       headers: headers,
     );
 
-    final str = resp.data;
-    if (str == null) {
-      throw WebdavException(
-        message: 'No data returned',
-        statusCode: resp.statusCode,
-        statusMessage: resp.statusMessage,
-        response: resp,
-      );
-    }
-
-    return WebdavFile.parseFiles(path, str, skipSelf: false).firstOrNull;
+    // Depth 0 may still list other resources; pick the one requested.
+    return _parseXmlBody(
+      resp,
+      'PROPFIND',
+      (body) => _parseFiles(body, path)
+          .firstWhereOrNull((file) => _isTarget(file.path, path)),
+    );
   }
 
   /// Read the bytes of a file
@@ -128,14 +116,33 @@ extension WebdavClientRead on WebdavClient {
     );
 
     if (resp.statusCode != 200 && resp.statusCode != 206) {
-      // Consume the error body so the connection can be reused instead of
-      // leaving the stream subscription hanging.
-      await resp.data?.stream.drain<void>();
-      throw _newResponseError(resp);
+      throw await _client._streamResponseError(resp);
     }
     if (resp.data == null) {
       throw _newResponseError(resp, 'Response data is null');
     }
     return resp;
+  }
+
+  /// Read the bytes of a file with stream and write to a local file
+  ///
+  /// - [remotePath] of the file
+  /// - [localPath] of the local file
+  /// - [onProgress] callback for progress
+  /// - [cancelToken] for cancelling the request
+  Future<void> readFile(
+    String remotePath,
+    String localPath, {
+    Map<String, dynamic>? headers,
+    void Function(int count, int total)? onProgress,
+    CancelToken? cancelToken,
+  }) async {
+    await _client.wdReadWithStream(
+      remotePath,
+      localPath,
+      headers: headers,
+      onProgress: onProgress,
+      cancelToken: cancelToken,
+    );
   }
 }

@@ -1,7 +1,6 @@
 import 'dart:async';
 import 'dart:io';
 
-import 'package:dio/dio.dart';
 import 'package:test/test.dart';
 import 'package:webdav_client_plus/webdav_client_plus.dart';
 
@@ -24,7 +23,7 @@ void main() {
       });
       final client = WebdavClient.noAuth(
           url: 'http://${server.address.host}:${server.port}');
-      expect(() => client.ping(), throwsA(isA<WebdavException>()));
+      expect(client.ping, throwsA(isA<WebdavException>()));
     });
   });
 
@@ -81,7 +80,7 @@ void main() {
           url: 'http://${server.address.host}:${server.port}');
       final tmpDir = await Directory.systemTemp.createTemp('wd_deflate_');
       addTearDown(() async {
-        if (await tmpDir.exists()) await tmpDir.delete(recursive: true);
+        if (tmpDir.existsSync()) await tmpDir.delete(recursive: true);
       });
 
       int? lastTotal;
@@ -103,7 +102,7 @@ void main() {
           url: 'http://${server.address.host}:${server.port}');
       final tmpDir = await Directory.systemTemp.createTemp('wd_compress2_');
       addTearDown(() async {
-        if (await tmpDir.exists()) await tmpDir.delete(recursive: true);
+        if (tmpDir.existsSync()) await tmpDir.delete(recursive: true);
       });
 
       int? lastTotal;
@@ -124,7 +123,7 @@ void main() {
           url: 'http://${server.address.host}:${server.port}');
       final tmpDir = await Directory.systemTemp.createTemp('wd_cancel2_');
       addTearDown(() async {
-        if (await tmpDir.exists()) await tmpDir.delete(recursive: true);
+        if (tmpDir.existsSync()) await tmpDir.delete(recursive: true);
       });
 
       // Cancel immediately - should trigger the cancel path
@@ -137,7 +136,7 @@ void main() {
         fail('Expected an exception from cancelled download');
       } catch (e) {
         expect(e, isException);
-        expect(await File('${tmpDir.path}/out.bin').exists(), isFalse,
+        expect(File('${tmpDir.path}/out.bin').existsSync(), isFalse,
             reason: 'closeAndDelete should remove the output file');
       }
     });
@@ -155,7 +154,7 @@ void main() {
           url: 'http://${server.address.host}:${server.port}');
       final tmpDir = await Directory.systemTemp.createTemp('wd_total_');
       addTearDown(() async {
-        if (await tmpDir.exists()) await tmpDir.delete(recursive: true);
+        if (tmpDir.existsSync()) await tmpDir.delete(recursive: true);
       });
 
       final progress = <(int, int)>[];
@@ -291,85 +290,6 @@ void main() {
       final client = WebdavClient.noAuth(
           url: 'http://${server.address.host}:${server.port}');
       expect(await client.readProps('/empty'), isNull);
-    });
-  });
-
-  // ========== webdav_file.dart:286,291,308 ==========
-  group('WebdavFile normalize edge cases', () {
-    test('query in self href stripped for skipSelf comparison (286)', () {
-      const xml = '''
-<?xml version="1.0" encoding="utf-8"?>
-<d:multistatus xmlns:d="DAV:">
-  <d:response>
-    <d:href>/d/?v=1</d:href>
-    <d:propstat>
-      <d:prop><d:resourcetype><d:collection/></d:resourcetype><d:displayname>d</d:displayname></d:prop>
-      <d:status>HTTP/1.1 200 OK</d:status>
-    </d:propstat>
-  </d:response>
-  <d:response>
-    <d:href>/d/c</d:href>
-    <d:propstat>
-      <d:prop><d:resourcetype/><d:displayname>c</d:displayname></d:prop>
-      <d:status>HTTP/1.1 200 OK</d:status>
-    </d:propstat>
-  </d:response>
-</d:multistatus>
-''';
-      final files = WebdavFile.parseFiles('/d/', xml, skipSelf: true);
-      expect(files.length, 1);
-      expect(files.first.name, 'c');
-    });
-
-    test('fragment in self href stripped for skipSelf comparison (291)', () {
-      const xml = '''
-<?xml version="1.0" encoding="utf-8"?>
-<d:multistatus xmlns:d="DAV:">
-  <d:response>
-    <d:href>/d/#top</d:href>
-    <d:propstat>
-      <d:prop><d:resourcetype><d:collection/></d:resourcetype><d:displayname>d</d:displayname></d:prop>
-      <d:status>HTTP/1.1 200 OK</d:status>
-    </d:propstat>
-  </d:response>
-  <d:response>
-    <d:href>/d/c</d:href>
-    <d:propstat>
-      <d:prop><d:resourcetype/><d:displayname>c</d:displayname></d:prop>
-      <d:status>HTTP/1.1 200 OK</d:status>
-    </d:propstat>
-  </d:response>
-</d:multistatus>
-''';
-      final files = WebdavFile.parseFiles('/d/', xml, skipSelf: true);
-      expect(files.length, 1);
-    });
-
-    test(
-        'non-collection ending with / gets slash stripped for non-collection (308)',
-        () {
-      const xml = '''
-<?xml version="1.0" encoding="utf-8"?>
-<d:multistatus xmlns:d="DAV:">
-  <d:response>
-    <d:href>/b/</d:href>
-    <d:propstat>
-      <d:prop><d:resourcetype><d:collection/></d:resourcetype><d:displayname>b</d:displayname></d:prop>
-      <d:status>HTTP/1.1 200 OK</d:status>
-    </d:propstat>
-  </d:response>
-  <d:response>
-    <d:href>/b/f/</d:href>
-    <d:propstat>
-      <d:prop><d:resourcetype/><d:displayname>f</d:displayname></d:prop>
-      <d:status>HTTP/1.1 200 OK</d:status>
-    </d:propstat>
-  </d:response>
-</d:multistatus>
-''';
-      final files = WebdavFile.parseFiles('/b/', xml, skipSelf: true);
-      expect(files.length, 1);
-      expect(files.first.name, 'f');
     });
   });
 }

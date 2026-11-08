@@ -1,7 +1,5 @@
 part of 'client.dart';
 
-final _httpPrefixReg = RegExp(r'(http|https)://');
-
 /// Thin wrapper around `dio` that injects WebDAV-specific behaviour such as
 /// automatic auth retries, base URL resolution and RFC 4918 error translation.
 class _WdDio with DioMixin {
@@ -10,18 +8,40 @@ class _WdDio with DioMixin {
   /// Configure the underlying dio mixin with sensible defaults (no automatic
   /// redirects, passthrough status validation) while wiring the correct adapter
   /// for the current platform.
-  _WdDio({required this.client, BaseOptions? options}) {
-    this.options = options ?? BaseOptions();
-    this.options.followRedirects = false;
+  _WdDio({required this.client}) {
+    options = BaseOptions(
+      headers: Map<String, dynamic>.of(client.webdavOptions.headers),
+      connectTimeout: client.webdavOptions.connectTimeout,
+      sendTimeout: client.webdavOptions.sendTimeout,
+      receiveTimeout: client.webdavOptions.receiveTimeout,
+    );
+    options.followRedirects = false;
 
-    this.options.validateStatus = (status) => true;
+    options.validateStatus = (status) => true;
 
     httpClientAdapter = getAdapter();
+    // dio merges client-wide headers after Options, so headers a request
+    // must not carry are dropped from the final RequestOptions.
+    interceptors.add(InterceptorsWrapper(
+      onRequest: (options, handler) {
+        final drop = options.extra.remove(_dropHeadersKey);
+        if (drop is Set<String>) {
+          final keys = options.headers.keys
+              .where((key) => drop.contains(key.toLowerCase()))
+              .toList();
+          keys.forEach(options.headers.remove);
+          if (drop.contains(Headers.contentTypeHeader)) {
+            options.contentType = null;
+          }
+        }
+        handler.next(options);
+      },
+    ));
   }
 
   /// Issue an HTTP request using WebDAV-aware defaults.
   ///
-  /// - Resolves relative [path] entries against [client.url].
+  /// - Resolves relative [path] entries against [WebdavClient.url].
   /// - Injects Authorization headers via the configured [Auth] strategy.
   /// - Retries 401 responses once when a Digest challenge is received.
   /// - Preserves the raw [Response] so higher-level helpers can perform
@@ -70,27 +90,20 @@ class _WdDio with DioMixin {
       }
     }
 
-    final rawTarget = path.startsWith(_httpPrefixReg)
-        ? path
-        : resolveAgainstBaseUrl(client.url, path);
-    final uri = Uri.parse(rawTarget);
+    final uri = Uri.parse(client.absoluteUrl(path));
 
     // authorization
-    // Credentials are only attached when the resolved target shares the
-    // configured base origin; a raw absolute target pointing at a different
-    // authority must not receive the client's Authorization header.
-    final baseUri = Uri.tryParse(client.url);
-    final sameOrigin =
-        baseUri != null && uri.hasAuthority && _sameOrigin(baseUri, uri);
-    if (sameOrigin) {
-      final requestTarget = _requestTarget(uri);
-      final authStr = client.auth.authorize(method, requestTarget);
-      if (authStr != null) {
-        options.headers?['authorization'] = authStr;
-      }
+    final requestTarget = _requestTarget(uri);
+    final authStr = client.auth.authorize(
+      method,
+      requestTarget,
+      body: _digestBody(data),
+    );
+    if (authStr != null) {
+      options.headers?['authorization'] = authStr;
     }
     if (stripSensitiveRedirectHeaders) {
-      _stripSensitiveRedirectHeaders(options.headers);
+      _dropHeaders(options, _sensitiveRedirectHeaders);
     }
     final resp = await requestUri<T>(
       uri,
@@ -106,38 +119,43 @@ class _WdDio with DioMixin {
       final w3AHeaders = resp.headers[Headers.wwwAuthenticateHeader];
 
       if (w3AHeaders != null && w3AHeaders.isNotEmpty) {
+        final challenges = parseAuthChallenges(w3AHeaders);
+        final authType = challenges.firstOrNull?.scheme;
+        bool offers(String scheme) => challenges.any((c) => c.scheme == scheme);
         switch (client.auth) {
           case final DigestAuth digestAuth:
-            // Find the digest challenge header
-            final digestHeader = w3AHeaders.firstWhereOrNull(
-              (header) => header.toLowerCase().contains('digest'),
-            );
+            final digestHeader = _pickDigestChallenge(challenges);
+            if (digestHeader == null && offers('digest')) {
+              throw WebdavException(
+                message: 'Digest auth failed, no supported algorithm or qop '
+                    'offered',
+                statusCode: 401,
+                response: resp,
+              );
+            }
             if (digestHeader != null) {
               if (authRetryCount >= 1) {
                 throw WebdavException(
                   message: 'Digest authentication failed after retry',
                   statusCode: 401,
-                  statusMessage: resp.statusMessage,
                   response: resp,
                 );
               }
-              // Create a new DigestAuth instance with the new challenge
-              client.auth = DigestAuth(
-                user: digestAuth.user,
-                pwd: digestAuth.pwd,
-                digestParts: DigestParts(digestHeader),
-              );
-
-              // Stream bodies cannot be retried.
+              // Stream bodies cannot be retried, so leave the client's auth
+              // untouched rather than commit a challenge no retry used.
               if (data is Stream) {
                 throw WebdavException(
                   message: 'Cannot retry streamed request after 401; '
                       'use in-memory bytes for PUT requests that may require auth',
                   statusCode: 401,
-                  statusMessage: resp.statusMessage,
                   response: resp,
                 );
               }
+              client.auth = DigestAuth(
+                user: digestAuth.user,
+                pwd: digestAuth.pwd,
+                digestParts: DigestParts(digestHeader),
+              );
               // Retry the request
               return req(
                 method,
@@ -149,61 +167,47 @@ class _WdDio with DioMixin {
                 cancelToken: cancelToken,
                 redirectCount: redirectCount,
                 authRetryCount: authRetryCount + 1,
+                stripSensitiveRedirectHeaders: stripSensitiveRedirectHeaders,
               );
             }
-            break;
 
           case final BasicAuth _:
             // Check if the server supports Basic auth
-            final basicHeader = w3AHeaders.firstWhereOrNull(
-              (header) => header.toLowerCase().contains('basic'),
-            );
-            if (basicHeader != null) {
+            if (offers('basic')) {
               throw WebdavException(
                 message:
                     'Basic Auth failed, maybe invalid username or password',
                 statusCode: 401,
-                statusMessage: resp.statusMessage,
                 response: resp,
               );
             } else {
               // Server does not support Basic auth
-              final authType = _extractAuthType(w3AHeaders.first);
               throw WebdavException(
                 message: 'Basic Auth failed, server requires $authType auth',
                 statusCode: 401,
-                statusMessage: resp.statusMessage,
                 response: resp,
               );
             }
 
           case final BearerAuth _:
-            final bearerHeader = w3AHeaders.firstWhereOrNull(
-              (header) => header.toLowerCase().contains('bearer'),
-            );
-            if (bearerHeader != null) {
+            if (offers('bearer')) {
               throw WebdavException(
                 message: 'Bearer Auth failed, maybe invalid or expired token',
                 statusCode: 401,
-                statusMessage: resp.statusMessage,
                 response: resp,
               );
             } else {
-              final authType = _extractAuthType(w3AHeaders.first);
               throw WebdavException(
                 message: 'Bearer Auth failed, server requires $authType auth',
                 statusCode: 401,
-                statusMessage: resp.statusMessage,
                 response: resp,
               );
             }
 
           case final NoAuth _:
-            final authType = _extractAuthType(w3AHeaders.first);
             throw WebdavException(
               message: 'Auth failed, server requires $authType auth',
               statusCode: 401,
-              statusMessage: resp.statusMessage,
               response: resp,
             );
         }
@@ -214,6 +218,7 @@ class _WdDio with DioMixin {
       final locations = resp.headers['location'];
       if (locations != null && locations.isNotEmpty) {
         if (redirectCount >= 10) {
+          await _drainResponseData(resp.data);
           throw WebdavException(
             message: 'Too many redirects',
             statusCode: resp.statusCode,
@@ -221,9 +226,11 @@ class _WdDio with DioMixin {
             response: resp,
           );
         }
-        await _drainResponseData(resp.data);
         final redirectPath = _resolveRedirectLocation(uri, locations.first);
+        // An unusable Location is handed back like a missing one.
+        if (redirectPath == null) return resp;
         final redirectUri = Uri.parse(redirectPath);
+        // A redirect that is not followed keeps its body for the caller.
         if (!_canRedirectTo(
           uri,
           redirectUri,
@@ -232,6 +239,7 @@ class _WdDio with DioMixin {
         )) {
           return resp;
         }
+        await _drainResponseData(resp.data);
         // 307/308 preserve the request body — streams can't be replayed.
         if (resp.statusCode != 303 && data is Stream) {
           throw WebdavException(
@@ -242,36 +250,44 @@ class _WdDio with DioMixin {
             response: resp,
           );
         }
-        final redirectMethod = resp.statusCode == 303 ? 'GET' : method;
+        // RFC 9110 §15.4.4: 303 turns everything but HEAD into a bodyless GET.
+        final seeOther = resp.statusCode == 303 && method != 'HEAD';
         return req(
-          redirectMethod,
+          seeOther ? 'GET' : method,
           redirectPath,
-          data: resp.statusCode == 303 ? null : data,
-          optionsHandler: optionsHandler,
+          data: seeOther ? null : data,
+          optionsHandler: seeOther
+              ? (Options options) {
+                  optionsHandler?.call(options);
+                  _dropHeaders(options, _entityHeaders);
+                }
+              : optionsHandler,
           onSendProgress: onSendProgress,
           onReceiveProgress: onReceiveProgress,
           cancelToken: cancelToken,
           redirectCount: redirectCount + 1,
           authRetryCount: authRetryCount,
-          stripSensitiveRedirectHeaders: !_sameOrigin(uri, redirectUri),
+          // Once a hop left the origin, later hops must not restore secrets.
+          stripSensitiveRedirectHeaders:
+              stripSensitiveRedirectHeaders || !sameOrigin(uri, redirectUri),
         );
       }
+      // No Location to follow: hand the response back so callers of the raw
+      // `request` escape hatch still see it. High-level verbs turn it into a
+      // 'No location header found' error via `_newResponseError`.
     }
 
     return resp;
   }
 
   /// Resolve a Location header against the URI that produced the redirect.
-  String _resolveRedirectLocation(Uri sourceUri, String location) {
+  String? _resolveRedirectLocation(Uri sourceUri, String location) {
     final trimmed = location.trim();
-    if (trimmed.isEmpty) {
-      return sourceUri.toString();
-    }
+    if (trimmed.isEmpty) return null;
     try {
-      final target = Uri.parse(trimmed);
-      return sourceUri.resolveUri(target).toString();
+      return sourceUri.resolveUri(Uri.parse(trimmed)).toString();
     } on FormatException {
-      return sourceUri.toString();
+      return null;
     }
   }
 
@@ -285,7 +301,7 @@ class _WdDio with DioMixin {
     if (!_isRedirectStatus(statusCode)) {
       return false;
     }
-    if (_sameOrigin(sourceUri, targetUri)) {
+    if (sameOrigin(sourceUri, targetUri)) {
       return true;
     }
     return client.auth is NoAuth && _isSafeRedirectMethod(method);
@@ -296,35 +312,38 @@ class _WdDio with DioMixin {
     return normalized == 'GET' || normalized == 'HEAD';
   }
 
-  void _stripSensitiveRedirectHeaders(Map<String, dynamic>? headers) {
-    headers?.removeWhere((key, _) => _sensitiveRedirectHeaders.contains(
-          key.toLowerCase(),
-        ));
+  /// Keep [names] (lowercase) off the request, including client-wide ones
+  /// that dio merges in after [options]; the interceptor removes those.
+  void _dropHeaders(Options options, Set<String> names) {
+    options.headers?.removeWhere((key, _) => names.contains(key.toLowerCase()));
+    final extra = options.extra ??= {};
+    final dropped = extra[_dropHeadersKey] as Set<String>?;
+    extra[_dropHeadersKey] = {...?dropped, ...names};
   }
 
-  bool _sameOrigin(Uri a, Uri b) {
-    final schemeA = a.scheme.toLowerCase();
-    final schemeB = b.scheme.toLowerCase();
-    if (schemeA != schemeB) {
-      return false;
-    }
-    if (a.host.toLowerCase() != b.host.toLowerCase()) {
-      return false;
-    }
-    int defaultPort(String scheme) {
-      switch (scheme) {
-        case 'https':
-          return 443;
-        case 'http':
-          return 80;
-        default:
-          return 0;
-      }
-    }
-
-    final portA = a.hasPort ? a.port : defaultPort(schemeA);
-    final portB = b.hasPort ? b.port : defaultPort(schemeB);
-    return portA == portB;
+  /// Read an unsuccessful streamed response into a [WebdavException], so the
+  /// connection is released and the error carries the body text.
+  Future<WebdavException<String>> _streamResponseError(
+    Response<ResponseBody> resp,
+  ) async {
+    final body = resp.data;
+    final text = body == null
+        ? null
+        : await utf8.decoder
+            .bind(body.stream)
+            .join()
+            .catchError((Object _) => '');
+    return _newResponseError(
+      Response<String>(
+        data: text,
+        requestOptions: resp.requestOptions,
+        statusCode: resp.statusCode,
+        statusMessage: resp.statusMessage,
+        headers: resp.headers,
+        redirects: resp.redirects,
+        extra: resp.extra,
+      ),
+    );
   }
 
   /// Drain stream response bodies before retrying so connections can be reused.
@@ -422,28 +441,19 @@ class _WdDio with DioMixin {
       path,
       data: dataStr,
       optionsHandler: (options) {
-        options.headers ??= <String, dynamic>{};
-        final requestHeaders = options.headers!;
         if (headers != null && headers.isNotEmpty) {
-          requestHeaders.addAll(headers);
+          options.headers?.addAll(headers);
         }
-        if (!_hasHeader(requestHeaders, 'depth')) {
-          requestHeaders['Depth'] = depth.value;
-        }
-        if (!requestHeaders.keys.any(
+        options.headers?['depth'] = depth.value;
+        if (!(options.headers?.keys.any(
               (key) => key.toLowerCase() == Headers.contentTypeHeader,
-            )) {
-          requestHeaders['content-type'] = 'application/xml;charset=UTF-8';
+            ) ??
+            false)) {
+          options.headers?['content-type'] = 'application/xml;charset=UTF-8';
         }
-        if (!_hasHeader(requestHeaders, Headers.acceptHeader)) {
-          requestHeaders['accept'] = 'application/xml,text/xml';
-        }
-        if (!_hasHeader(requestHeaders, 'accept-charset')) {
-          requestHeaders['accept-charset'] = 'utf-8';
-        }
-        if (!_hasHeader(requestHeaders, 'accept-encoding')) {
-          requestHeaders['accept-encoding'] = '';
-        }
+        options.headers?['accept'] = 'application/xml,text/xml';
+        options.headers?['accept-charset'] = 'utf-8';
+        options.headers?['accept-encoding'] = '';
 
         options.responseType = ResponseType.plain;
       },
@@ -476,15 +486,13 @@ class _WdDio with DioMixin {
       path,
       data: data,
       optionsHandler: (options) {
-        options.headers ??= <String, dynamic>{};
         if (headers != null && headers.isNotEmpty) {
           options.headers?.addAll(headers);
         }
         if (ifHeader != null && ifHeader.isNotEmpty) {
           options.headers?['If'] = ifHeader;
         }
-        final hasEntity = data != null && data.toString().isNotEmpty;
-        if (hasEntity &&
+        if (data != null &&
             !(options.headers?.keys.any(
                   (key) => key.toLowerCase() == Headers.contentTypeHeader,
                 ) ??
@@ -532,9 +540,7 @@ class _WdDio with DioMixin {
         if (headers != null && headers.isNotEmpty) {
           options.headers?.addAll(headers);
         }
-        if (!_hasHeader(options.headers!, 'depth')) {
-          options.headers?['Depth'] = 'infinity'; // RFC 4918 §9.6.1
-        }
+        options.headers?['Depth'] = 'infinity'; // RFC 4918 §9.6.1
         if (ifHeader != null && ifHeader.isNotEmpty) {
           options.headers?['If'] = ifHeader;
         }
@@ -557,23 +563,20 @@ class _WdDio with DioMixin {
     PropsDepth depth = PropsDepth.infinity,
     String? ifHeader,
     Map<String, dynamic>? headers,
-    int parentCreateAttempts = 0,
+    bool parentCreated = false,
   }) async {
-    final method = isCopy == true ? 'COPY' : 'MOVE';
+    final method = isCopy ? 'COPY' : 'MOVE';
     final resp = await req(
       method,
       oldPath,
       optionsHandler: (options) {
-        final destinationHeader = resolveAgainstBaseUrl(
-          client.url,
-          newPath,
-        );
+        final destinationHeader = client.absoluteUrl(newPath);
         options.headers ??= <String, dynamic>{};
         if (headers != null && headers.isNotEmpty) {
           options.headers?.addAll(headers);
         }
         options.headers?['Destination'] = destinationHeader;
-        options.headers?['Overwrite'] = overwrite == true ? 'T' : 'F';
+        options.headers?['Overwrite'] = overwrite ? 'T' : 'F';
         options.headers?['Depth'] = depth.value;
         if (ifHeader != null && ifHeader.isNotEmpty) {
           options.headers?['If'] = ifHeader;
@@ -585,28 +588,15 @@ class _WdDio with DioMixin {
 
     final status = resp.statusCode ?? -1;
     if (status == 207) {
-      final body = resp.data;
-      if (body is! String) {
+      final responses = _parseXmlBody(resp, 'Multi-Status', parseMultiStatus);
+      // RFC 4918 §9.8.5: a 207 means errors kept the operation from finishing,
+      // so one naming no member cannot be read as success.
+      final failures = responses.isEmpty
+          ? ['$method reported Multi-Status without any member']
+          : _memberFailures(responses);
+      if (failures.isNotEmpty) {
         throw WebdavException(
-          message: 'Multi-Status response did not include text body to inspect',
-          statusCode: status,
-          statusMessage: resp.statusMessage,
-          response: resp,
-        );
-      }
-      try {
-        final failures = parseMultiStatusFailureMessages(body);
-        if (failures.isNotEmpty) {
-          throw WebdavException(
-            message: failures.join('; '),
-            statusCode: status,
-            statusMessage: resp.statusMessage,
-            response: resp,
-          );
-        }
-      } on XmlException catch (error) {
-        throw WebdavException(
-          message: 'Unable to parse Multi-Status response: $error',
+          message: failures.join('; '),
           statusCode: status,
           statusMessage: resp.statusMessage,
           response: resp,
@@ -615,19 +605,16 @@ class _WdDio with DioMixin {
       return;
     } else if (status >= 200 && status < 300) {
       return;
-    } else if (status == 409) {
-      if (parentCreateAttempts >= 1) {
-        // A second 409 after parent creation means the conflict is unrelated
-        // to a missing destination parent — surface the original response
-        // instead of recursing indefinitely.
-        throw _newResponseError(resp);
-      }
-      await _createParent(
+    } else if (status == 409 && !parentCreated) {
+      // The If header and conditions describe the source and destination,
+      // not the intermediate collections.
+      final createParent = _createParent(
         newPath,
         cancelToken: cancelToken,
-        ifHeader: ifHeader,
-        headers: headers,
+        headers: parentMkcolHeaders(headers),
       );
+      if (createParent == null) throw _newResponseError(resp);
+      await createParent;
       return wdCopyMove(
         oldPath,
         newPath,
@@ -637,7 +624,7 @@ class _WdDio with DioMixin {
         depth: depth,
         ifHeader: ifHeader,
         headers: headers,
-        parentCreateAttempts: parentCreateAttempts + 1,
+        parentCreated: true,
       );
     } else {
       throw _newResponseError(resp);
@@ -667,6 +654,184 @@ class _WdDio with DioMixin {
       throw _newResponseError(resp);
     }
     return resp.data as Uint8List;
+  }
+
+  /// read a file with stream
+  /// Download a resource to [savePath], tracking progress for large responses.
+  Future<void> wdReadWithStream(
+    String path,
+    String savePath, {
+    Map<String, dynamic>? headers,
+    void Function(int count, int total)? onProgress,
+    CancelToken? cancelToken,
+  }) async {
+    // Cancelling is the only way to make dio drop an unread body, so keep a
+    // token of our own that follows the caller's.
+    final bodyToken = CancelToken();
+    cancelToken?.whenCancel.then((e) => bodyToken.cancel(e.error)).ignore();
+    final resp = await req<ResponseBody>(
+      'GET',
+      path,
+      optionsHandler: (options) {
+        if (headers != null && headers.isNotEmpty) {
+          options.headers?.addAll(headers);
+        }
+        options.responseType = ResponseType.stream;
+      },
+      cancelToken: bodyToken,
+    );
+    if (!_isSuccessfulReadStatus(resp.statusCode)) {
+      throw await _streamResponseError(resp);
+    }
+
+    final respData = resp.data;
+    if (respData == null) {
+      throw _newResponseError(resp, 'Response data is null');
+    }
+
+    resp.headers = Headers.fromMap(respData.headers);
+
+    final file = File(savePath);
+    final RandomAccessFile fileReader;
+    try {
+      await file.create(recursive: true);
+      fileReader = await file.open(mode: FileMode.write);
+    } catch (_) {
+      // Release the connection the unread body would otherwise hold.
+      bodyToken.cancel('Local file could not be opened');
+      rethrow;
+    }
+
+    //Create a Completer to notify the success/error state.
+    final completer = Completer<Response<ResponseBody>>();
+    final future = completer.future;
+    var received = 0;
+
+    // dio already bounds the gap between chunks with receiveTimeout.
+    final stream = respData.stream;
+    var compressed = false;
+    var total = 0;
+    final contentEncoding = resp.headers.value(Headers.contentEncodingHeader);
+    if (contentEncoding != null) {
+      // Any coding but identity changes the length of the decoded stream.
+      compressed = contentEncoding
+          .split(',')
+          .map((coding) => coding.trim().toLowerCase())
+          .any((coding) => coding.isNotEmpty && coding != 'identity');
+    }
+    if (compressed) {
+      total = -1;
+    } else {
+      final contentLength = resp.headers.value(Headers.contentLengthHeader);
+      if (contentLength != null) {
+        final parsed = int.tryParse(contentLength);
+        if (parsed != null) {
+          total = parsed;
+        }
+      } else {
+        total = -1;
+      }
+    }
+
+    late StreamSubscription<Uint8List> subscription;
+    Future<Null>? asyncWrite;
+    // Shared so every path waits for the same close, and a cancel after a
+    // successful download cannot delete it.
+    Future<void>? closing;
+
+    /// Close and remove the partial file. Never throws: the caller already
+    /// gets the error that started the cleanup.
+    Future<void> closeAndDelete({bool awaitWrite = true}) =>
+        closing ??= () async {
+          try {
+            if (awaitWrite) await asyncWrite;
+            await fileReader.close();
+          } catch (_) {
+            // Still delete below.
+          }
+          try {
+            await file.delete();
+          } catch (_) {
+            // Already gone, or nothing more can be done.
+          }
+        }();
+
+    void fail(Object error) {
+      if (completer.isCompleted) return;
+      completer.completeError(
+        // Cancellation surfaces as dio's own error, as it always has.
+        error is DioException && error.type == DioExceptionType.cancel
+            ? error
+            : WebdavException(
+                message: error.toString(),
+                statusCode: resp.statusCode,
+                statusMessage: resp.statusMessage,
+                response: resp,
+              ),
+      );
+    }
+
+    subscription = stream.listen(
+      (data) {
+        subscription.pause();
+        asyncWrite = fileReader.writeFrom(data).then((_) {
+          received += data.length;
+          onProgress?.call(received, total);
+          if (cancelToken == null || !cancelToken.isCancelled) {
+            subscription.resume();
+          }
+        }).catchError((Object err) async {
+          try {
+            await subscription.cancel();
+            // This handler is part of asyncWrite, so it must not await it.
+            await closeAndDelete(awaitWrite: false);
+          } finally {
+            fail(err);
+          }
+        });
+      },
+      onDone: () async {
+        Object? closeError;
+        await (closing ??= () async {
+          try {
+            await asyncWrite;
+            await fileReader.close();
+          } catch (err) {
+            closeError = err;
+            try {
+              await file.delete();
+            } catch (_) {
+              // Report closeError regardless.
+            }
+          }
+        }());
+        if (closeError != null) {
+          fail(closeError!);
+        } else if (!completer.isCompleted) {
+          completer.complete(resp);
+        }
+      },
+      onError: (Object e) async {
+        try {
+          await closeAndDelete();
+        } finally {
+          fail(e);
+        }
+      },
+      cancelOnError: true,
+    );
+
+    // A paused subscription never sees dio's cancel error, so finish here.
+    cancelToken?.whenCancel.then((error) async {
+      try {
+        await subscription.cancel();
+        await closeAndDelete();
+      } finally {
+        fail(error);
+      }
+    }).ignore();
+
+    await future;
   }
 
   /// write a file with bytes
@@ -770,10 +935,8 @@ class _WdDio with DioMixin {
           requestHeaders.addAll(headers);
         }
 
-        if (!_hasHeader(requestHeaders, 'timeout')) {
-          requestHeaders['Timeout'] =
-              _serializeTimeoutHeader(timeout, timeoutPreferences);
-        }
+        requestHeaders['Timeout'] =
+            _serializeTimeoutHeader(timeout, timeoutPreferences);
         if (ifHeader != null) {
           requestHeaders['If'] = ifHeader;
         }
@@ -854,9 +1017,7 @@ class _WdDio with DioMixin {
             false)) {
           options.headers?['content-type'] = 'application/xml;charset=UTF-8';
         }
-        if (!_hasHeader(options.headers!, Headers.acceptHeader)) {
-          options.headers?['accept'] = 'application/xml,text/xml';
-        }
+        options.headers?['accept'] = 'application/xml,text/xml';
 
         options.responseType = ResponseType.plain;
       },
@@ -944,6 +1105,8 @@ const _parentMkcolFilteredHeaders = <String>{
   ..._entityHeaders,
 };
 
+const _dropHeadersKey = 'webdav_client_plus.dropHeaders';
+
 const _sensitiveRedirectHeaders = <String>{
   'authorization',
   'cookie',
@@ -953,49 +1116,93 @@ const _sensitiveRedirectHeaders = <String>{
 bool _isSuccessfulReadStatus(int? statusCode) =>
     statusCode == 200 || statusCode == 206;
 
-/// Return `true` when [headers] contains [name] (case-insensitively).
-bool _hasHeader(Map<String, dynamic>? headers, String name) {
-  if (headers == null) return false;
-  final lower = name.toLowerCase();
-  return headers.keys.any((key) => key.toLowerCase() == lower);
-}
-
 extension on _WdDio {
   /// Extract the advertised WWW-Authenticate scheme from a challenge header.
-  String? _extractAuthType(String authHeader) {
-    final parts = authHeader.split(' ');
-    if (parts.isNotEmpty) {
-      final authType = parts[0].replaceAll(',', '');
-      return authType.isNotEmpty ? authType : null;
+  /// Request body bytes for Digest `auth-int`, which only applies to bodies
+  /// held in memory.
+  List<int> _digestBody(Object? data) {
+    final auth = client.auth;
+    if (auth is! DigestAuth || !auth.hashesBody) return const [];
+    return switch (data) {
+      null => const [],
+      final String text => utf8.encode(text),
+      final List<int> bytes => bytes,
+      _ => throw WebdavException(
+          message: 'Digest qop=auth-int needs the request body in memory; '
+              'streamed bodies cannot be hashed',
+        ),
+    };
+  }
+
+  /// The parameters of the strongest Digest challenge whose algorithm and qop
+  /// are supported (RFC 7616 §3.7), or `null` when none is.
+  String? _pickDigestChallenge(List<AuthChallenge> challenges) {
+    String? best;
+    var bestRank = -1;
+    for (final challenge in challenges) {
+      if (challenge.scheme != 'digest') continue;
+      final rank = DigestAuth.challengeRank(DigestParts(challenge.params));
+      if (rank > bestRank) {
+        best = challenge.params;
+        bestRank = rank;
+      }
     }
-    return null;
+    return best;
   }
 
   /// Lazily create intermediate collections for PUT/COPY/MOVE operations.
   ///
   /// Mimics SabreDAV's behaviour by walking up the path, issuing MKCOL as
   /// needed until the target's parent exists, while ensuring we stay within the
-  /// original server authority.
+  /// base URL.
   Future<void>? _createParent(
     String path, {
     CancelToken? cancelToken,
     String? ifHeader,
     Map<String, dynamic>? headers,
   }) {
+    final parent = switch (client.webdavOptions.pathMode) {
+      PathMode.baseRelative => _parentInBase(path),
+      PathMode.legacy => _legacyParent(path),
+    };
+    if (parent == null) {
+      return null;
+    }
+    return client.mkdirAll(
+      parent,
+      cancelToken: cancelToken,
+      ifHeader: ifHeader,
+      headers: headers,
+    );
+  }
+
+  /// Parent collection of [path] below the base URL, or `null` when the
+  /// parent is the base itself or lies outside it.
+  String? _parentInBase(String path) {
+    final target = hrefToTarget(client.url, client.absoluteUrl(path));
+    if (!target.startsWith('/')) {
+      return null;
+    }
+    final trimmed = target.endsWith('/')
+        ? target.substring(0, target.length - 1)
+        : target;
+    final slashIndex = trimmed.lastIndexOf('/');
+    return slashIndex <= 0 ? null : trimmed.substring(0, slashIndex + 1);
+  }
+
+  // TODO: remove with the legacy path mode.
+  String? _legacyParent(String path) {
     final baseUri = Uri.parse(client.url);
 
     Uri? resolvedUri;
     try {
-      final resolvedTarget = path.startsWith(_httpPrefixReg)
-          ? path
-          : resolveAgainstBaseUrl(client.url, path);
-      resolvedUri = Uri.parse(resolvedTarget);
+      resolvedUri = Uri.parse(client.absoluteUrl(path));
     } catch (_) {
       resolvedUri = null;
     }
 
     if (resolvedUri != null && resolvedUri.hasAuthority) {
-      if (_hasAuthority(baseUri) && !_authoritiesMatch(baseUri, resolvedUri)) {
+      if (_hasAuthority(baseUri) && !sameOrigin(baseUri, resolvedUri)) {
         return null;
       }
       if (!_hasAuthority(baseUri)) {
@@ -1034,12 +1241,7 @@ extension on _WdDio {
     if (parentPath == '/' || parentPath.isEmpty) {
       return null;
     }
-    return client.mkdirAll(
-      parentPath,
-      cancelToken: cancelToken,
-      ifHeader: ifHeader,
-      headers: headers,
-    );
+    return parentPath;
   }
 
   /// Return the encoded path, preserving percent-encoded segment semantics.
@@ -1054,35 +1256,6 @@ extension on _WdDio {
 
   /// True when the URI contains authority information (host/port).
   bool _hasAuthority(Uri uri) => uri.host.isNotEmpty || uri.hasAuthority;
-
-  /// Compare two authorities, accounting for implicit default ports.
-  bool _authoritiesMatch(Uri a, Uri b) {
-    final schemeA = a.scheme.isEmpty ? 'http' : a.scheme;
-    final schemeB = b.scheme.isEmpty ? 'http' : b.scheme;
-    if (schemeA.toLowerCase() != schemeB.toLowerCase()) {
-      return false;
-    }
-    final hostA = a.host.toLowerCase();
-    final hostB = b.host.toLowerCase();
-    if (hostA != hostB) {
-      return false;
-    }
-    final portA = a.hasPort ? a.port : _defaultPortForScheme(schemeA);
-    final portB = b.hasPort ? b.port : _defaultPortForScheme(schemeB);
-    return portA == portB;
-  }
-
-  /// Return the conventional port for a scheme when none was provided.
-  int _defaultPortForScheme(String scheme) {
-    switch (scheme.toLowerCase()) {
-      case 'https':
-        return 443;
-      case 'http':
-        return 80;
-      default:
-        return 0;
-    }
-  }
 
   /// Derive the server-relative path from a potentially absolute target.
   String _serverPathFromTarget(String target) {
